@@ -1,9 +1,11 @@
 from datetime import datetime
+import json
 import os
+import threading
 import time
 from dotenv import load_dotenv
+from flask import Flask
 
-# Load environment variables from .env file
 load_dotenv()
 
 from script import (
@@ -16,75 +18,54 @@ from script import (
     send_lead_to_discord,
 )
 
+# 1. Tiny Flask web server so Render hosts it for $0/month
+app = Flask(__name__)
+
+
+@app.route("/")
+def health_check():
+  return "Reddit Lead Finder Bot is Active and Running!", 200
+
 
 def run_pipeline_with_logging(user_profile, search_terms, webhook_url):
   now = datetime.now().strftime("%H:%M:%S")
   print(f"[{now}] Checking Reddit RSS feeds for new leads...")
 
   seen_ids = load_leads(DEFAULT_HISTORY_FILE)
-  print(f"[{now}] Loaded {len(seen_ids)} previously processed lead IDs.")
-
   raw_leads = scrape_reddit(search_terms, seen_ids)
-  print(f"[{now}] Found {len(raw_leads)} new un-seen raw leads on Reddit.")
+
   if not raw_leads:
     print(f"[{now}] No new hiring posts found right now.")
     return []
 
-  # Save raw leads immediately so Gemini never re-evaluates the same post
   for lead in raw_leads:
     save_lead(DEFAULT_HISTORY_FILE, lead["id"])
 
-  print(f"[{now}] Sending leads to Gemini for scoring...")
+  print(f"[{now}] Sending {len(raw_leads)} leads to Gemini for scoring...")
   qualified_leads = score_filter(user_profile, raw_leads)
-  print(f"[{now}] Gemini qualified {len(qualified_leads)} relevant lead(s).")
+
   if not qualified_leads:
-    print(
-        f"[{now}] All found leads were filtered out (low score/irrelevant)."
-    )
+    print(f"[{now}] All leads filtered out (low score/irrelevant).")
     return []
 
-  print(f"[{now}] Generating pitches with Gemini...")
   pitched_leads = generate_pitches(user_profile, qualified_leads)
 
-  sent_leads = []
   for lead in pitched_leads:
     if webhook_url:
       success = send_lead_to_discord(webhook_url, lead)
       if success:
-        sent_leads.append(lead)
-        print(
-            f"[{now}] SUCCESS: Sent lead '{lead.get('title')[:40]}...' to"
-            " Discord!"
-        )
-      else:
-        print(f"[{now}] ERROR: Discord Webhook rejected lead {lead.get('id')}.")
-    else:
-      print(f"[{now}] WARNING: No Webhook URL configured! Skipping Discord.")
+        print(f"[{now}] SUCCESS: Sent '{lead.get('title')[:30]}...' to Discord!")
 
-  return sent_leads
+  return pitched_leads
 
 
-if __name__ == "__main__":
-  # Custom Profile tailored to your specific tech stack
+def bot_loop():
   user_profile = """
-  Freelance Full-Stack Developer, Web Scraping & Automation Specialist.
-  Frontend Skills: HTML5, CSS3, JavaScript (ES6+), React.
-  Backend & Data Skills: Python, REST APIs, Databases (SQL & NoSQL), Data Science & Analytics (pandas).
-  Specialized Services: Custom Web Application Development, Web Scraping & Data Extraction, Bot & Process Automation, API Integrations, Data Analysis Pipelines.
-  Looking for: Full-stack web projects, Web scraping scripts, Automation tools, Python backend builds, and Data science tasks.
-  """
-
-  search_terms = ["hiring", "developer", "programmer", "python", "react"]
+    Freelance Full-Stack Developer skilled in Python, JavaScript, React, Node.js, and API integrations.
+    Looking for contract work, MVP builds, script automation, and web development projects.
+    """
+  search_terms = ["hiring", "developer", "programmer"]
   webhook_url = os.getenv("DISCORDhook") or os.getenv("DISCORD_WEBHOOK_URL", "")
-
-  print("==================================================")
-  print("         REDDIT LEAD FINDER BOT STARTED           ")
-  print("==================================================")
-  print(f"Webhook Found: {bool(webhook_url)}")
-  print(
-      "Stack Target:  React, Python, Web Scraping, Automation, Data Science"
-  )
-  print("--------------------------------------------------\n")
 
   while True:
     try:
@@ -93,6 +74,14 @@ if __name__ == "__main__":
       now = datetime.now().strftime("%H:%M:%S")
       print(f"[{now}] CRITICAL ERROR: {e}")
 
-    now = datetime.now().strftime("%H:%M:%S")
-    print(f"[{now}] Cycle complete. Sleeping for 5 minutes...\n")
     time.sleep(300)
+
+
+if __name__ == "__main__":
+  # Start the lead finder bot in a background thread
+  bot_thread = threading.Thread(target=bot_loop, daemon=True)
+  bot_thread.start()
+
+  # Start Flask web server for Render on port 10000
+  port = int(os.environ.get("PORT", 10000))
+  app.run(host="0.0.0.0", port=port)
